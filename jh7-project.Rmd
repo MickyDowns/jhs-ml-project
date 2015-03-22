@@ -1,0 +1,354 @@
+---
+title: 'Exercising Right: Using sensors to ensure proper form'
+output: pdf_document
+---
+### michael downs
+
+## synopsis
+Many people measure the amount they exercise (miles run, weights lifted, etc.). Few measure the quality of their exercise, their "form". Using data from sensors placed on the belts, forearms, arms, and dumbells of six participants, I used four algorithms to classify barbell lifts. Classifications range from correct form (class A) to four incorrect forms including throwing the elbows (class B), throwing the hips (class E), etc..
+
+I found random forest (rf) and boosting (gbm) to be effective at classifying activites based on sensor output. Both algorithms achieved 97%+ sensitivity and 99%+ specificity scores on cross validation. (The random forest model scored 20/20 on the project test set.) Further, both models maintained high cross validation scores: 1. across four train/test datasets that were constructed using different methodologies and 2. across a range of variables from over 100 down to as small as 10. K-nearest neighbors (knn) and basic regression trees (rpart) were less successful with sensitivity scores of $\approx$ 88% and $\approx$ 53% on cross validation, respectively. 
+
+I walk thru model construction below including use of cross validation, estimates of out-of-sample error rates and the rationale for decisions made along the way.
+
+## the model
+### getting data
+The training data set included 160 variables and about 20,000 records. Each record contained a subset of sensor readings sampled during the exercise period for each of the six particpants. Basic exploratory analysis showed that 67% of the columns contained 97% NA values which would have to be cleaned. That analysis also identified a roughly even distribution of observations among the three classes and signficant signal that could be seen when fields were plotted against each other (below).
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,results='hide',warning=FALSE,fig.show='asis',fig.height=4,fig.width=7}
+
+train=read.csv("pml-training.csv",header=TRUE,sep=",",quote="\"",dec=".",fill=TRUE,comment.char="")
+test=read.csv("pml-testing.csv",header=TRUE,sep=",",quote="\"",dec=".",fill=TRUE,comment.char="")
+
+dim(train);dim(test);unique(train$classe) # X index. numerics as factors. many NA's. some div/0's. 
+train=train[,2:160];test=test[,2:160] # get rid of index
+#159th column "classe"
+
+par(mfrow=c(1,2))
+plot(unique(train$classe),ylim=c(0,1000),main="class distribution")
+for(i in unique(train$user_name)){
+     temp=train[train$user_name==i,]
+     classes=table(temp$classe)
+     lines(unique(train$classe),classes)
+     if(exists("class.means")){class.means=rbind(class.means,classes)}else{class.means=classes}
+}
+lines(unique(train$classe),colMeans(class.means),col="red",lwd=5)
+rm(class.means,temp,classes) # roughly equal distribution among the classes by individual
+
+plot(train$roll_belt,train$yaw_belt,col=train$classe,main="clearly signal here") # hello
+
+num.na=NULL; for(i in 1:dim(train)[2]){num.na[i]=sum(is.na(train[,i]))};num.na
+# can't impute all NAs. need to try something else.
+```
+
+### cleaning data
+
+I generated four train/test datasets. While I deleted timestamp and window columns for all datasets (to the extent exercisers are following a script, these columns provide information that wouldn't be available otherwise), each dataset was developed according to its own methodology. Highlights include:
+1. $\emph{train.base:} I replaced NA's by the means for their respective columns. Given most algorithms use column variance for predictions, this approach elimnates NAs while not changing column variance.
+2. $\emph{train.nzv:} I deleted rows with near zero varaiance (nzv()) then set NAs in remaining columns to the respective column mean.
+3. $\emph{train.na:} I deleted columns with greater than 97% NA. 
+4. $\emph{train.rev:} I converted factor to numeric using $levels(train.rev[,i]))[train.rev[,i]]$, then set any remaining NAs to the respective column means. 
+
+The effect of these changes and others not covered is illusrated in the kurtosis graphic below. From left to right I show how how the data was imported, what the data looke like using for train.base and what the data looked like for train.rev. 
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,results='hide',warning=FALSE,fig.show='asis',fig.height=4,fig.width=7}
+library(RANN);library(caret)
+
+## train.base is baseline. zoom in on a problem field
+train.base=train[,c(1,7:159)] # remove non-movement columns
+par(mfrow=c(1,3));plot(train.base$kurtosis_roll_belt,col=train.base$classe,main="kurtosis roll - train")
+
+# convert factor to numerics
+for(i in 2:dim(train.base)[2]-1){
+     if(is.factor(train.base[,i])){train.base[,i]=(as.numeric(train.base[,i])-1)}
+}
+
+# train.na deletes columns w/ over 97% NA
+num.na=NULL
+for(i in 1:dim(train.base)[2]){num.na[i]=sum(is.na(train.base[,i]))>(0.97*dim(train.base)[1])};num.na
+train.na=train.base[,!num.na]
+
+# train.nzv removes near zero variables. 
+nzv=nearZeroVar(train.base,saveMetrics=TRUE)
+train.nzv=train.base[,!names(train.base)%in%rownames(nzv[nzv[,4]==TRUE,])]
+
+## nzv deleted more than na. 60% overlap remains
+sum(nzv[,4]);sum(num.na)
+length(intersect(names(train.nzv),names(train.na)))
+dim(train.base);dim(train.nzv);dim(train.na)
+
+# converting remaining NA fields to respective column means
+for(i in 2:(dim(train.base)[2]-1)){train.base[is.na(train.base[,i]),i]=mean(train.base[,i],na.rm=TRUE)}
+for(i in 2:(dim(train.nzv)[2]-1)){train.nzv[is.na(train.nzv[,i]),i]=mean(train.nzv[,i],na.rm=TRUE)}
+for(i in 2:(dim(train.na)[2]-1)){train.na[is.na(train.na[,i]),i]=mean(train.na[,i],na.rm=TRUE)}
+
+plot(train.base$kurtosis_roll_belt,col=train$classe,main="kurtosis roll - base")
+sum(is.na(train.base));sum(is.na(train.nzv));sum(is.na(train.na))
+
+# careful cleaning of train.rev
+train.rev=train[,c(1,7:159)] # remove non-movement columns
+
+## 67 columns w/ over 97% NA's. converting factor vars using: levels(train.rev[,i]))[train.rev[,i]]
+num.na=NULL;for(i in 1:dim(train.rev)[2]){num.na[i]=sum(is.na(train.rev[,i]))};num.na
+for(i in 2:(dim(train.rev)[2]-1)){
+     if(is.factor(train.rev[,i])){train.rev[,i]=
+                                       as.numeric(levels(train.rev[,i]))[train.rev[,i]]}
+     train.rev[is.na(train.rev[,i]),i]=mean(train.rev[,i],na.rm=TRUE)
+}
+plot(train.rev$kurtosis_roll_belt,col=train.rev$classe,main="kurtosis roll - rev")
+
+## coversion above introduced 6 columns w/ NaN's - deleting 
+num.na=NULL;for(i in 1:dim(train.rev)[2]){num.na[i]=sum(is.na(train.rev[,i]))};num.na
+num.na=NULL;for(i in 1:dim(train.rev)[2]){num.na[i]=sum(is.na(train.rev[,i]))>0};num.na
+train.rev=train.rev[,!num.na]
+num.na=NULL;for(i in 1:dim(train.rev)[2]){num.na[i]=sum(is.na(train.rev[,i]))};num.na
+
+## removing three columns were problematic during PCA
+which(names(train.rev)=="amplitude_yaw_forearm")
+which(names(train.rev)=="amplitude_yaw_dumbbell")
+which(names(train.rev)=="amplitude_yaw_belt")
+train.rev=train.rev[,-c(18,91,127)]
+
+# note: didn't find boxcox to be additive to tree models. 
+```
+
+### pca pre-processing
+I performed feature selection in two steps. The first was pca analysis. I based my approach on the lecture where pca was used only for highly correlated variables (rather than to reduce dimensions and regularize all variables). Specifically, I looped over the data sets five times replacing highly correlated variables with their principal components. As the approach was a bit involved, I've included the code below. This approach reduced variables between 25% and 30% across data sets. 
+
+```{r eval=TRUE,cache=TRUE,echo=TRUE,results='hide',warning=FALSE,fig.show='asis',fig.height=4,fig.width=7}
+dset=list(ds=list("train.base","train.nzv","train.na","train.rev"),
+          trnx=list(train.base,train.nzv,train.na,train.rev),
+          trny=train$classe)
+
+par(mfrow=c(1,1))
+plot(1:5,type="n",main="pca dimension reductions",ylim=c(0,160),xlab="pca iterations",ylab="total variables")
+
+for(k in 1:length(dset$trnx)){
+     target=dset$trnx[[k]][,c(2:(dim(dset$trnx[[k]])[2]-1))]
+     gph.line=NULL
+     cat("********** new file: ",dset$ds[[k]],"\n")
+     for(i in 1:5){ # was 7
+          cat("1. start: dim(target)",dim(target),"\n")
+          gph.line[i]=dim(target)[2]
+          cor.decs=matrix(NA,dim(target)[2],2)
+          M=abs(cor(target)) # find predictors w/ high correlation
+          diag(M)=0 # set cor for vars w/ themselves to 0 
+     
+          for(j in 1:dim(target)[2]){
+               cor.decs[j,1]=j
+               cor.decs[j,2]=length(which(M[,j]>max(0.5,(1-0.1*i)),arr.ind=T))
+          }
+          clean=target[,c(which(M[,which.max(cor.decs[,2])]>max(0.5,(1-0.1*i)),arr.ind=T),
+                          which.max(cor.decs[,2]))]
+     
+          cat("2. consolidating: ",cor.decs[which.max(cor.decs[,2]),][2]+1,"\n")
+          comps=prcomp(clean);print(summary(comps))
+     
+          target=target[,-c(which(M[,which.max(cor.decs[,2])]>max(0.5,(1-0.1*i)),arr.ind=T),
+                            which.max(cor.decs[,2]))]
+          
+          tmp=as.matrix(summary(comps)$importance);pc.cut=which(tmp[3,]>0.95)[1]
+          comps=comps$x[,1:pc.cut];comps=as.data.frame(comps)
+          for(z in 1:pc.cut){
+               colnames(comps)[z]=c(sprintf("%s_%s_%s_%s","iter",i,"pc",z))}
+          cat("3. into: ",dim(comps)[2],"\n")
+          
+          target=cbind(target,comps)
+     }
+     dset$trnx[[k]]=target
+     lines(1:5,gph.line,col=k,lwd=2)
+}
+legend("bottomleft",c("train.base  ","train.nzv  ","train.na  ","train.rev  "),col=c(1,2,3,4),lwd=2)
+
+rm(tmp,clean,target)
+for(i in 1:4){dset$trnx[[i]]$user_name=train$user_name
+              dset$trnx[[i]]$classe=train$classe}
+```
+
+### models
+I built a two loop model training structure to iterate thru the datasets outlined above and a set of core algorithms including regression trees (rpart), k-nearest neighbors (knn), random forest (rf) and boosting (gbm). Each iteration of the internal loop fit the model, made predictions on a cross validation set and stored off the fit for subsequent processing. 
+
+Getting thru the dataset required careful resource management. While data cleaning / pca eliminated $\frac{1}{3}$ to $\frac{1}{2}$ of the columns, early iterations from 70 to 115 columns. Accordingly, I trimmed train/test database by up to 50%. I also enabled parallel processing.
+
+Beyond cross vaidation performed within the Caret function which showed 95-99% accuracy (1%-5% OOB error rates), I separately $\textbf{cross validated}$ each dataset / algorithm combination using a 70 / 30 train / holdout test set cross validation. 
+
+As the approach was fairly involved, I've provided code below. Below that are the cross validated prediction sensitivity and specificity for each model. The left graphic shows all the models inclding the outperformance of the rf and gbm models. The right looks more closely at the rf and gbm results. 
+
+```{r eval=FALSE,cache=TRUE,echo=TRUE,results='hold',warning=FALSE,fig.show='hide',fig.height=4,fig.width=7}
+
+# controller for algo iterations
+algos=list(algo=list("rpart","rf","knn","gbm")) ## logistic, lda failed.
+
+# structures to hold rf fits
+fset=list(data=list("train.base","train.nzv","train.na","train.rev"),
+          rpart=list(NA,NA,NA,NA),
+          rf=list(NA,NA,NA,NA),
+          knn=list(NA,NA,NA,NA),
+          gbm=list(NA,NA,NA,NA))
+
+# process data sets, algos, folds
+# rm(res,res.mstr)
+
+## enable parallel processing
+library(parallel); library(doParallel)
+registerDoParallel(clust <- makeForkCluster(detectCores()))
+
+for(i in 1:length(dset$ds)){
+     # cut data in half
+     train.cv=dset$trnx[[i]][train$user_name==unique(train$user_name)[1] | 
+                                  train$user_name==unique(train$user_name)[2] | 
+                                  train$user_name==unique(train$user_name)[3],]
+     
+     for(k in 1:length(algos$algo)){
+               # train and test sets
+               set.seed(123)
+               inTrain=createDataPartition(y=train.cv$classe,p=0.7,list=FALSE)
+               training=train.cv[inTrain,]
+               testing=train.cv[-inTrain,]
+               
+               cat("******* FITTING: algo:",algos$algo[[k]],", data dim: ",dim(training),"\n")
+               # fit and predict
+               fit=train(classe~.,training,method=algos$algo[[k]])
+               
+               # store and print fit
+               fset[[k+1]][[i]]=fit;print(fit)
+               
+               # predict
+               preds=predict(fit,testing)
+               
+               # create output table
+               res=as.data.frame(t(as.matrix(c(algos$algo[[k]],dset$ds[[i]]))))
+               colnames(res)=c("algo","data set")
+               sense=round(t(confusionMatrix(preds,testing$classe)$byClass[,1]),3)
+               spec=round(t(confusionMatrix(preds,testing$classe)$byClass[,2]),3)
+               res=cbind(res,sense,round(mean(sense),3),spec,round(mean(spec),3))
+               if(exists("res.mstr")){res.mstr=rbind(res.mstr,res)}else{res.mstr=res}
+               print(res.mstr)
+     }
+}
+stopCluster(clust)
+```
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,results='hide',warning=FALSE,fig.show='asis',fig.height=4,fig.width=7}
+# was cache=FALSE,eval=TRUE,echo=FALSE,results='markup'   
+par(mfrow=c(1,2))
+plot(1-res.mstr[,14],res.mstr[,8],xlab="mean(1-specificity (fpr))",ylab="mean(sensitivity (tpr))",xlim=c(0,0.3),ylim=c(0.43,1),main="'ROC' - all algos",pch=19,cex=1.5,col=c(1:(5*4)))
+text(x=1-res.mstr[,14],y=res.mstr[,8],
+     labels=sprintf("%s",res.mstr[,1]),
+     pos=4,cex=0.75,col="blue",offset=1)
+
+plot(1-res.mstr[1:16,14],res.mstr[1:16,8],xlab="mean(1-specificity (fpr))",ylab="mean(sensitivity (tpr))",xlim=c(0,0.11),ylim=c(0.945,1),main="'ROC' - rf/gbm",pch=19,cex=1.5,col=c(1:(5*4)))
+text(x=1-res.mstr[,14],y=res.mstr[,8],
+     labels=sprintf("%s-%s",res.mstr[,1],res.mstr[,2]),
+     pos=4,cex=0.75,col="blue",offset=1)
+
+dev.copy(pdf,file="init_mod_select_2.pdf");dev.off()
+
+```
+
+### top 20 vars
+Finally, I re-ran the rf and gbm algorithms using the train.rev database and just their top variables. I compared four sets of results for different numbers of top variables including 100, 20, 15 and 10. Interestingly the performance did not degrade significantly for either algorithm. While rf moved from 99.5% to 97.5% accuracy between the 100 variable and 10 variable models, gbm actually increased its accuracy from 97% to 98% using as variables decreased from 100 to 15. 
+
+```{r eval=FALSE,cache=TRUE,echo=FALSE,results='hide',warning=FALSE,fig.show='hide',fig.height=4,fig.width=7}
+# cache=TRUE,eval=FALSE,echo=FALSE  
+# rf
+## build new dataset 
+train.cv=dset$trnx[[4]][train$user_name==unique(train$user_name)[4] | 
+                             train$user_name==unique(train$user_name)[5] | 
+                             train$user_name==unique(train$user_name)[6],]
+
+imp.vars=as.data.frame(varImp(fset[[3]][[4]])[1]);imp.vars$row.nms=rownames(imp.vars)
+imp.vars=imp.vars[order(imp.vars[,1],decreasing=TRUE),][1:5,]
+train.rf=train.cv[,names(train.cv) %in% imp.vars[,2]];train.rf$classe=train.cv$classe
+
+set.seed(9)
+inTrain=createDataPartition(y=train.rf$classe,p=0.7,list=FALSE)
+training=train.rf[inTrain,]
+testing=train.rf[-inTrain,]
+
+## fit model
+library(parallel); library(doParallel)
+registerDoParallel(clust <- makeForkCluster(detectCores()))
+fit.rf=train(classe~.,training,"rf")
+print(fit.rf)
+stopCluster(clust)
+
+# predict and tabulate
+preds=predict(fit.rf,testing)   
+res=as.data.frame(t(as.matrix(c("rf","train.rev(5)"))))
+colnames(res)=c("algo","data set")
+sense=round(t(confusionMatrix(preds,testing$classe)$byClass[,1]),3)
+spec=round(t(confusionMatrix(preds,testing$classe)$byClass[,2]),3)
+res=cbind(res,sense,round(mean(sense),3),spec,round(mean(spec),3))
+if(exists("res.mstr")){res.mstr=rbind(res.mstr,res)}else{res.mstr=res}
+print(res.mstr)
+
+# gbm
+imp.vars=as.data.frame(varImp(fset[[5]][[4]])[1]);imp.vars$row.nms=rownames(imp.vars)
+imp.vars=imp.vars[order(imp.vars[,1],decreasing=TRUE),][1:10,]
+train.gbm=train.cv[,names(train.cv) %in% imp.vars[,2]];train.gbm$classe=train.cv$classe
+
+set.seed(9)
+inTrain=createDataPartition(y=train.gbm$classe,p=0.7,list=FALSE)
+training=train.gbm[inTrain,]
+testing=train.gbm[-inTrain,]
+
+## fit model
+library(parallel); library(doParallel)
+registerDoParallel(clust <- makeForkCluster(detectCores()))
+fit.gbm=train(classe~.,training,"gbm")
+print(fit.gbm)
+stopCluster(clust)
+
+# predict and tabulate
+preds=predict(fit.gbm,testing)   
+res=as.data.frame(t(as.matrix(c("gbm","train.rev(10)"))))
+colnames(res)=c("algo","data set")
+sense=round(t(confusionMatrix(preds,testing$classe)$byClass[,1]),3)
+spec=round(t(confusionMatrix(preds,testing$classe)$byClass[,2]),3)
+res=cbind(res,sense,round(mean(sense),3),spec,round(mean(spec),3))
+if(exists("res.mstr")){res.mstr=rbind(res.mstr,res)}else{res.mstr=res}
+print(res.mstr)
+```
+
+```{r eval=TRUE,cache=TRUE,echo=FALSE,results='hide',warning=FALSE,fig.show='asis',fig.height=4,fig.width=7}
+# cache=FALSE,eval=TRUE,echo=FALSE,results='markup'  
+# output chart
+par(mfrow=c(1,1))
+pr.mst=res.mstr[c(14,16,17,18,19,22,23,24),c(1,2,8,14)]
+plot(1-pr.mst[,4],pr.mst[,3],xlab="mean(1-specificity (fpr))",ylab="mean(sensitivity (tpr))",
+     xlim=c(0,0.015),ylim=c(0.96,1),main="'ROC' - rf/gbm",pch=19,cex=1.5,col=c(2:9))
+text(1-pr.mst[,4],pr.mst[,3],labels=sprintf("%s-%s",pr.mst[,1],pr.mst[,2]),pos=4,
+     cex=0.75,col="blue",offset=1)
+```
+
+```{r cache=FALSE,eval=FALSE,echo=FALSE}
+
+library(parallel); library(doParallel)
+registerDoParallel(clust <- makeForkCluster(detectCores()))
+
+     set.seed(123)
+     inTrain=createDataPartition(y=train.rev.imp.20$classe,p=0.7,list=FALSE)
+     training=train.rev.imp.20[inTrain,]
+     testing=train.rev.imp.20[-inTrain,]
+     fit.imp.20=train(classe~.,training,method="rf",prox=TRUE)
+     
+     pred=predict(fit.imp.20,testing)
+     confusionMatrix(pred,testing$classe)
+     varImp(fit.imp.20);plot(varImp(fit.imp.20));fit.imp.20$finalModel$importance
+
+stopCluster(clust)
+
+answers=as.character(predict(fit.imp.20,test))
+
+pml_write_files = function(x){
+  n = length(x)
+  for(i in 1:n){
+    filename = paste0("problem_id_",i,".txt")
+    write.table(x[i],file=filename,quote=FALSE,row.names=FALSE,col.names=FALSE)
+  }
+}
+ 
+pml_write_files(answers)
+
+``` 
